@@ -73,6 +73,52 @@ fn ok(h: &mut Harness<'static, PdfCraftApp>, c: &ControlClient, method: &str, pa
     call(h, c, method, params).unwrap_or_else(|e| panic!("{method}: {e}"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn control_combine_original_paths_keep_modified_and_sort_without_saving() {
+    use std::fs::{File, FileTimes};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("pdfcraft-original-combine-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let late = dir.join("late.png");
+    let early = dir.join("early.png");
+    for (path, seconds) in [(&late, 1_700_000_000), (&early, 1_600_000_000)] {
+        let mut encoder = png::Encoder::new(File::create(path).unwrap(), 2, 2);
+        encoder.set_color(png::ColorType::Rgb);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[30, 80, 140, 30, 80, 140, 30, 80, 140, 30, 80, 140]).unwrap();
+        writer.finish().unwrap();
+        File::options().write(true).open(path).unwrap().set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds))).unwrap();
+    }
+    let (mut h, c) = harness();
+    ok(&mut h, &c, "ui.set", json!({"key": "combine-view", "value": "list"}));
+    ok(&mut h, &c, "ui.combine.add", json!({"paths": [late, early]}));
+    let state = ok(&mut h, &c, "ui.state", json!({}));
+    assert_eq!(state["combine"]["files"], json!(["late.png", "early.png"]));
+    assert_eq!(state["combine"]["items"][0]["modified_unix_seconds"], 1_700_000_000u64);
+    assert_eq!(state["combine"]["items"][1]["modified_unix_seconds"], 1_600_000_000u64);
+    assert_eq!(state["documents"].as_array().unwrap().len(), 1, "source images must not become unsaved tabs");
+    ok(&mut h, &c, "ui.click", json!({"label": "Modified"}));
+    assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["combine"]["files"], json!(["early.png", "late.png"]));
+    ok(&mut h, &c, "ui.click", json!({"label": "Modified, sorted ascending"}));
+    assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["combine"]["files"], json!(["late.png", "early.png"]));
+    for invalid in [json!({"paths": []}), json!({"paths": [12]}), json!({"paths": [""]}), json!({"paths": ["x"], "unknown": true})] {
+        assert!(call(&mut h, &c, "ui.combine.add", invalid).is_err());
+    }
+    assert!(call(&mut h, &c, "ui.combine.add", json!({"paths": vec![late.clone(); 1001]})).is_err());
+    assert!(call(&mut h, &c, "ui.combine.add", json!({"paths": [late, dir.join("missing.png")]})).is_err());
+    assert_eq!(
+        ok(&mut h, &c, "ui.state", json!({}))["combine"]["files"],
+        json!(["late.png", "early.png"]),
+        "a failed batch must not partly add files"
+    );
+    assert_eq!(std::fs::metadata(&late).unwrap().modified().unwrap(), UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+    assert_eq!(std::fs::metadata(&early).unwrap().modified().unwrap(), UNIX_EPOCH + Duration::from_secs(1_600_000_000));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn control_resize_reports_observed_dimensions_and_rejects_invalid_sizes() {
     let (mut h, c) = harness();
@@ -274,6 +320,41 @@ fn theme_commands_and_options_report_preference_and_effective_colours() {
     assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["theme_preference"], "System");
 }
 
+#[test]
+fn lithuanian_password_dialog_translates_dynamic_labels_and_validation() {
+    let (mut h, c) = harness();
+    ok(&mut h, &c, "ui.set", json!({ "key": "language", "value": "lt" }));
+    ok(&mut h, &c, "ui.set", json!({ "key": "dialog", "value": "protect" }));
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::RadioButton, "Peržiūrėti");
+    h.get_by_role_and_label(egui::accesskit::Role::RadioButton, "Redaguoti").click();
+    h.run_steps(2);
+    assert!(!h.state().protect_draft.viewing);
+    h.get_by_role_and_label(egui::accesskit::Role::PasswordInput, "Įveskite slaptažodį");
+    h.get_by_role_and_label(egui::accesskit::Role::PasswordInput, "Pakartokite slaptažodį");
+    h.state_mut().protect_draft.password = "abc".into();
+    h.state_mut().protect_draft.confirm = "xyz".into();
+    h.run_steps(2);
+    h.get_by_label("Slaptažodžiai nesutampa.");
+}
+
+#[test]
+fn lithuanian_inspector_title_updates_through_the_control_channel() {
+    let (mut h, c) = harness();
+    ok(&mut h, &c, "ui.set", json!({ "key": "panel", "value": "comments" }));
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::Tab, "Inspector");
+    let documents = ok(&mut h, &c, "ui.state", json!({}))["documents"].clone();
+    ok(&mut h, &c, "ui.set", json!({ "key": "language", "value": "lt" }));
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::Tab, "Inspektorius");
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Tab, "Inspector").is_none());
+    assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["documents"], documents);
+    ok(&mut h, &c, "ui.set", json!({ "key": "language", "value": "en" }));
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::Tab, "Inspector");
+}
+
 /// Switching the interface language changes labels only: documents, their dirty state and the
 /// command ids agents drive stay exactly the same.
 #[test]
@@ -285,7 +366,7 @@ fn language_switch_preserves_document_and_command_ids() {
     let documents = ok(&mut h, &c, "ui.state", json!({}))["documents"].clone();
     assert_eq!(documents[0]["dirty"], true);
     let commands = ok(&mut h, &c, "ui.commands", json!({}));
-    for code in ["ja", "zh-hans", "fr", "de", "uk", "en"] {
+    for code in ["ja", "zh-hans", "fr", "de", "uk", "lt", "en"] {
         ok(&mut h, &c, "ui.set", json!({ "key": "language", "value": code }));
         h.run_steps(2);
         let state = ok(&mut h, &c, "ui.state", json!({}));
@@ -304,7 +385,8 @@ fn language_switch_preserves_document_and_command_ids() {
         h.run_steps(2);
     }
     let error = call(&mut h, &c, "ui.set", json!({ "key": "language", "value": "xx" })).unwrap_err();
-    assert!(error.contains("auto, en, ja"), "{error}");
+    let codes = std::iter::once(i18n::AUTO).chain(i18n::Lang::all().map(i18n::Lang::code)).collect::<Vec<_>>().join(", ");
+    assert_eq!(error, format!("language must be one of {codes}"));
     assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["language"], "en");
 }
 
@@ -1310,7 +1392,8 @@ fn explicit_panel_requests_reveal_inactive_group_members() {
     h.get_by_label("This document has no bookmarks.");
     ok(&mut h, &c, "ui.command", json!({"id":"edit.edit_text"}));
     h.run_steps(4);
-    h.get_by_label("Edit text & images");
+    // The Edit panel's own row: the tool's name is on the floating toolbar too while it is on.
+    h.get_by_label("Header and footer");
 }
 
 #[test]
@@ -1513,4 +1596,122 @@ fn initial_zoom_option_is_applied_before_the_first_viewport_layout() {
         });
         assert_eq!(h.state().views[0].zoom, percent as f32 / 100.0);
     }
+}
+
+/// #1306: a coordinate that only overflows once narrowed to a pointer position is refused by
+/// click and drag, as move refuses it, before any pointer input is queued; the frames that follow
+/// run, and the channel keeps working.
+#[test]
+fn click_and_drag_refuse_coordinates_that_overflow_like_move() {
+    let (mut h, c) = harness();
+    for (method, params) in [
+        ("ui.move", json!({ "x": 1e39, "y": -1e39 })),
+        ("ui.click", json!({ "x": 1e39, "y": -1e39 })),
+        ("ui.click", json!({ "x": 40.0, "y": 1e39 })),
+        ("ui.drag", json!({ "from": [1e39, -1e39], "to": [40.0, 40.0], "steps": 1 })),
+        ("ui.drag", json!({ "from": [40.0, 40.0], "to": [40.0, -1e39], "steps": 1 })),
+        // Each end fits, but not the way from one to the other.
+        ("ui.drag", json!({ "from": [-3e38, 40.0], "to": [3e38, 40.0], "steps": 1 })),
+    ] {
+        let e = call(&mut h, &c, method, params.clone()).expect_err(&format!("{method} {params} is refused"));
+        assert!(e.starts_with(&format!("{method}: ")) && e.contains("finite"), "{e}");
+        h.run_steps(4);
+        assert_eq!(ok(&mut h, &c, "ui.inspect", json!({ "query": "Read", "role": "Button" }))["count"], 1);
+    }
+    let read = ok(&mut h, &c, "ui.inspect", json!({ "query": "Read", "role": "Button" }))["widgets"][0]["rect"].clone();
+    let (x, y) = (read[0].as_f64().unwrap() + 4.0, read[1].as_f64().unwrap() + 4.0);
+    assert_eq!(ok(&mut h, &c, "ui.click", json!({ "x": x, "y": y }))["clicked"], json!([x, y]));
+    ok(&mut h, &c, "ui.drag", json!({ "from": [x, y], "to": [x + 10.0, y], "steps": 2 }));
+}
+
+#[test]
+fn page_size_shows_while_the_pointer_is_in_the_bottom_left_quadrant() {
+    let (mut h, _c) = harness();
+    let area = h.state().views[0].viewport_rect();
+    let shown = |h: &Harness<'static, PdfCraftApp>| {
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("page-size-hint"));
+        h.ctx.memory(|m| m.areas().visible_last_frame(&layer))
+    };
+    let away = area.center() + egui::vec2(300.0, -200.0);
+    h.event(egui::Event::PointerMoved(away));
+    h.run_steps(3);
+    assert!(!shown(&h), "top-right: hidden");
+    h.event(egui::Event::PointerMoved(area.left_bottom() + egui::vec2(80.0, -80.0)));
+    h.run_steps(3);
+    assert!(shown(&h), "bottom-left: shown");
+    if let Ok(dir) = std::env::var("PDFCRAFT_SHOT_DIR") {
+        h.render().unwrap().save(format!("{dir}/page-size-hint.png")).unwrap();
+    }
+    h.event(egui::Event::PointerMoved(away));
+    h.run_steps(3);
+    assert!(!shown(&h), "pointer left: hidden again");
+}
+
+#[test]
+fn navigation_history_commands_and_rail_are_per_tab_and_non_editing() {
+    for os in [egui::os::OperatingSystem::Nix, egui::os::OperatingSystem::Mac, egui::os::OperatingSystem::Windows] {
+        navigation_history_for_os(os);
+    }
+}
+
+fn navigation_history_for_os(os: egui::os::OperatingSystem) {
+    let (mut h, c) = harness();
+    h.ctx.set_os(os);
+    h.run_steps(2);
+    let enabled =
+        |list: Value, id: &str| list["commands"].as_array().unwrap().iter().find(|cmd| cmd["id"] == id).unwrap()["enabled"].as_bool().unwrap();
+    assert!(!enabled(ok(&mut h, &c, "ui.commands", json!({})), "view.previous_view"));
+    assert!(call(&mut h, &c, "ui.command", json!({"id": "view.previous_view"})).is_err());
+    // Empty-history shortcuts were silent before registry integration and must stay silent.
+    for key in ["[", "]"] {
+        ok(&mut h, &c, "ui.key", json!({"key": key, "modifiers": ["command"]}));
+        assert!(h.state().toast.is_none(), "an unavailable history action must not ask to open the already-open document");
+    }
+    let before = h.state().session.get(h.state().views[0].id).unwrap().bytes.clone();
+    ok(&mut h, &c, "ui.set", json!({"key": "page", "value": "4"}));
+    assert!(enabled(ok(&mut h, &c, "ui.commands", json!({})), "view.previous_view"));
+    // The real rail button is accessible and invokes the same history, not the adjacent page.
+    let shortcut = if h.ctx.os() == egui::os::OperatingSystem::Mac { "⌘[" } else { "Ctrl+[" };
+    ok(&mut h, &c, "ui.click", json!({"label": &format!("Previous view ({shortcut})")}));
+    assert_eq!(h.state().views[0].current, 0);
+    assert!(enabled(ok(&mut h, &c, "ui.commands", json!({})), "view.next_view"));
+    ok(&mut h, &c, "ui.command", json!({"id": "view.next_view"}));
+    assert_eq!(h.state().views[0].current, 3);
+    ok(&mut h, &c, "ui.set", json!({"key": "page", "value": "5"}));
+    ok(&mut h, &c, "ui.key", json!({"key": "[", "modifiers": ["command"]}));
+    assert_eq!(h.state().views[0].current, 3, "shortcut traverses exactly one history entry");
+    ok(&mut h, &c, "ui.key", json!({"key": "]", "modifiers": ["command"]}));
+    assert_eq!(h.state().views[0].current, 4);
+    ok(&mut h, &c, "ui.command", json!({"id": "view.previous_view"}));
+    h.state_mut().open_bytes("other.pdf", None, fixture(5)).unwrap();
+    assert!(!enabled(ok(&mut h, &c, "ui.commands", json!({})), "view.previous_view"));
+    ok(&mut h, &c, "ui.set", json!({"key": "page", "value": "2"}));
+    ok(&mut h, &c, "ui.command", json!({"id": "view.previous_view"}));
+    assert_eq!(h.state().views[1].current, 0);
+    assert_eq!(h.state().views[0].current, 3, "other tab's history does not move this document");
+    h.state_mut().active = Some(0);
+    ok(&mut h, &c, "ui.command", json!({"id": "view.previous_view"}));
+    assert_eq!(h.state().views[0].current, 0);
+    assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().bytes, before);
+    assert!(!h.state().session.get(h.state().views[0].id).unwrap().dirty);
+    h.state_mut().open_bytes("reopened.pdf", None, before.as_ref().clone()).unwrap();
+    assert!(h.state().views.last().unwrap().back.is_empty());
+    assert!(h.state().views.last().unwrap().forward.is_empty());
+}
+
+#[test]
+fn routine_continuous_scrolling_does_not_add_navigation_history() {
+    let (mut h, c) = harness_pages(20);
+    ok(&mut h, &c, "ui.set", json!({"key": "animation_effects", "value": "off"}));
+    h.hover_at(egui::pos2(700.0, 450.0));
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -1200.0),
+        modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+    });
+    h.run_steps(8);
+    assert!(h.state().views[0].current > 0, "the wheel really moved to a later page");
+    assert!(h.state().views[0].back.is_empty());
+    assert!(h.state().views[0].forward.is_empty());
 }
