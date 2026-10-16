@@ -6,6 +6,9 @@ pub use craft_print::{
     parse_lpstat_e, parse_ppd, parse_windows_printers, ppd_text, printers, printers_parsed,
 };
 
+mod preferences;
+pub use preferences::{DriverSettings, edit_printer_preferences, read_printer_preferences};
+
 /// The driver's job options for a printer (CUPS: its PPD, with the queue's current defaults);
 /// empty when it has none or on other platforms. Reads files and runs `lpoptions`, so call it
 /// when the user asks, not every frame.

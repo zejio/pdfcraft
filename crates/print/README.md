@@ -75,3 +75,11 @@ a matching page. On Windows craft-print sends the sheets as vectors with a Print
 for the sheet's exact paper and no scaling (#599's approach), validated by the driver:
 a job is refused, not shrunk, when the driver lacks the paper or would change it. Verify
 the driver's paper settings and physical calibration before relying on drawing scale.
+
+Windows Printer Properties readback (local development): the UI waits on a worker for the
+preferences window to close, then reads the user's DEVMODE through winprint's safe conversion
+API. Paper, monochrome/color, copies, collation, duplex and orientation update the app's
+print controls, layout and outgoing job. Vendor paper IDs use a recognized standard form name (Apeos PS
+uses ID 129 for A4). Unknown forms are reported instead of printing on the previous paper.
+Read-only diagnostic: `cargo run -p pdfcraft-print --example printer_preferences -- "queue name"`.
+Hardware output still needs validation.

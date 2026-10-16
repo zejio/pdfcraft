@@ -38,6 +38,8 @@
 //!   reports the choice and `ui.state.theme` reports the resolved light/dark colours.
 //! - `ui.open {path}`: accept a file open; native opens report `pending: true` until they
 //!   complete and are listed in `ui.state.pending_opens`.
+//! - `ui.combine.add {paths}`: add 1–1000 original files to Combine, retaining their names
+//!   and filesystem modification times. Sources are not opened as document tabs or saved.
 //! - `ui.screenshot {region?}`: PNG of the window (base64), optionally cropped to a rect.
 
 use std::collections::{HashMap, VecDeque};
@@ -185,6 +187,9 @@ pub(crate) trait Host {
     fn commands(&self) -> Value;
     fn set(&mut self, key: &str, value: &str) -> Reply;
     fn open(&mut self, path: &str) -> Reply;
+    fn combine_add(&mut self, _paths: &[String]) -> Reply {
+        Err("adding original Combine paths is unavailable on this host".into())
+    }
     fn quit(&mut self, ctx: &egui::Context) -> bool;
 }
 
@@ -295,6 +300,24 @@ impl Control {
                 Ok(Handled::Now(host.set(str_param("key")?, &value)))
             }
             "ui.open" => Ok(Handled::Now(host.open(str_param("path")?))),
+            "ui.combine.add" => {
+                only_params(p, method, &["paths"])?;
+                let paths = p.get("paths").and_then(Value::as_array).ok_or("ui.combine.add: paths must be an array of file paths")?;
+                if paths.is_empty() || paths.len() > 1000 {
+                    return Err("ui.combine.add: select between 1 and 1000 files".into());
+                }
+                let paths = paths
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .filter(|path| !path.is_empty())
+                            .map(str::to_owned)
+                            .ok_or("ui.combine.add: every path must be a nonempty string")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Handled::Now(host.combine_add(&paths)))
+            }
             "ui.inspect" => Ok(Handled::Now(Ok(self.inspect(p)))),
             "ui.click" => self.click(p),
             "ui.focus" => self.focus(p),
@@ -356,7 +379,7 @@ impl Control {
                 Ok(Handled::Screenshot(region))
             }
             other => Err(format!(
-                "unknown method {other:?} (ui.state, ui.inspect, ui.click, ui.focus, ui.resize, ui.quit, ui.move, ui.drag, ui.type, ui.key, ui.command, ui.commands, ui.set, ui.open, ui.screenshot)"
+                "unknown method {other:?} (ui.state, ui.inspect, ui.click, ui.focus, ui.resize, ui.quit, ui.move, ui.drag, ui.type, ui.key, ui.command, ui.commands, ui.set, ui.open, ui.combine.add, ui.screenshot)"
             )),
         })();
         r.unwrap_or_else(|e| Handled::Now(Err(e)))
@@ -687,6 +710,10 @@ impl Host for crate::PdfCraftApp {
                 "view": self.combine_view.as_str(),
                 "zoom": self.combine_zoom,
                 "files": self.combine_draft.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+                "items": self.combine_draft.iter().map(|f| json!({
+                    "name": f.name,
+                    "modified_unix_seconds": f.modified.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration| duration.as_secs()),
+                })).collect::<Vec<_>>(),
                 "selected": self.combine_selection(),
                 "thumbnails": self.combine_thumbnails().iter().map(|t| format!("{t:?}")).collect::<Vec<_>>(),
                 "expanded": self.combine_expanded().iter().filter_map(|i| self.combine_draft.get(*i).map(|f| f.name.clone())).collect::<Vec<_>>(),
@@ -720,6 +747,15 @@ impl Host for crate::PdfCraftApp {
             "tools_side": if self.docking.tools_on_right() { "right" } else { "left" },
             "right_panel": self.right.map(|r| format!("{r:?}")),
             "dialog": self.dialog.map(|d| format!("{d:?}")),
+            "print": {
+                "printer": self.print_draft.printer,
+                "preferences_loading": self.print_draft.preferences_loading,
+                "paper": pdfcraft_engine::print::PAPERS.get(self.print_draft.paper).map(|p| p.0),
+                "grayscale": self.print_draft.grayscale,
+                "copies": self.print_draft.copies,
+                "duplex": format!("{:?}", self.print_draft.duplex),
+                "driver_error": self.print_draft.driver_error,
+            },
             "palette_open": self.palette_open,
             "theme": format!("{:?}", self.theme),
             "theme_preference": self.theme_preference,
@@ -751,6 +787,18 @@ impl Host for crate::PdfCraftApp {
 
     fn set(&mut self, key: &str, value: &str) -> Reply {
         self.set_option(key, value).map(|()| json!({ "set": key, "value": value }))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn combine_add(&mut self, paths: &[String]) -> Reply {
+        let before = self.combine_draft.len();
+        let expected = before.checked_add(paths.len()).ok_or("too many Combine files")?;
+        let paths: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+        self.use_paths(crate::files::FilePurpose::Combine, &paths);
+        if self.combine_draft.len() != expected {
+            return Err(self.toast.as_ref().map(|toast| toast.0.clone()).unwrap_or_else(|| "could not add the original files to Combine".into()));
+        }
+        Ok(json!({ "added": paths.len(), "total": self.combine_draft.len() }))
     }
 
     #[cfg(not(target_arch = "wasm32"))]

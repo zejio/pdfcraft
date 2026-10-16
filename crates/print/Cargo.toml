@@ -14,3 +14,7 @@ pdfcraft-cos = { workspace = true }
 pdfcraft-content = { workspace = true }
 pdfcraft-model = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Safe conversion of the current user's printer defaults to a complete DEVMODE.
+winprint = { git = "https://github.com/storytold/winprint.rs", rev = "5f80b9baf6b58937c401656634e42d33f00ddf49", default-features = false }

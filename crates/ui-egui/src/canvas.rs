@@ -27,7 +27,8 @@ const TEXT_TAG: u64 = 1 << 62;
 const GRID_TAG: u64 = 1 << 61;
 /// Preview rasters tagged with this bit are converted to luminance on receipt, matching the
 /// monochrome print requested by Print ▸ Print in grayscale.
-const GRAYSCALE_TAG: u64 = 1 << 60;
+// PRINT_TAG already owns bit 60; keeping these distinct preserves color print previews.
+const GRAYSCALE_TAG: u64 = 1 << 59;
 /// The tag of a raster that is out of date (shown until its replacement arrives).
 const STALE_TAG: u64 = u64::MAX;
 /// Pages whose raster would exceed this many device pixels on a side are drawn in tiles.
@@ -5237,6 +5238,38 @@ mod tests {
         // Unmultiply RGB first, so a translucent colour keeps its paper-relative luminance.
         let translucent = gray.pixels[1];
         assert_eq!(translucent.to_array(), [42, 42, 42, 128]);
+    }
+
+    #[test]
+    fn print_preview_keeps_color_and_switches_back_from_grayscale() {
+        let ctx = egui::Context::default();
+        let mut v = view(1, PageLayout::Single, true);
+        let mut previous = None;
+        for monochrome in [false, true, false] {
+            v.set_print_grayscale(monochrome);
+            v.queue_print_previews(&[(0, 1.0)]);
+            v.last_queue = std::mem::take(&mut v.frame_queue);
+            let request = *v.last_queue.first().unwrap();
+            if let Some(old) = previous {
+                assert_eq!(v.receive_result(&ctx, solid_result(old, 1, 1)), 0, "a stale preview must not replace the new color mode");
+            }
+            let mut result = solid_result(request, 1, 1);
+            result.rgba = pdfcraft_render::Pixels::from(vec![u32::from_ne_bytes([220, 60, 30, 255])]);
+            assert_eq!(v.receive_result(&ctx, result), 4);
+            let texture = v.page_preview(0).unwrap();
+            let mut delta = ctx.tex_manager().write().take_delta();
+            let image = &delta.set.get(&texture).unwrap().last().unwrap().image;
+            let egui::ImageData::Color(image) = image;
+            let pixel = image.pixels[0].to_array();
+            delta.clear();
+            if monochrome {
+                assert_eq!(pixel[0], pixel[1]);
+                assert_eq!(pixel[1], pixel[2]);
+            } else {
+                assert_eq!(pixel, [220, 60, 30, 255], "color print previews must preserve the source RGB values");
+            }
+            previous = Some(request);
+        }
     }
 
     #[test]

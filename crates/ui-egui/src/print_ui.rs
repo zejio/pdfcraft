@@ -84,6 +84,9 @@ pub struct PrintDraft {
     /// Driver options set away from the printer's defaults, for `driver_options`' printer.
     pub driver_choices: std::collections::BTreeMap<String, String>,
     pub show_driver_options: bool,
+    /// The driver dialog runs on a worker; do not submit using stale settings while it is open.
+    pub preferences_loading: bool,
+    pub preferences_requested: Option<String>,
     /// Why the printer's preferences window didn't open (Windows).
     pub driver_error: Option<String>,
     /// Label: turn a further 180°.
@@ -134,6 +137,8 @@ impl Default for PrintDraft {
             driver_options: None,
             driver_choices: Default::default(),
             show_driver_options: false,
+            preferences_loading: false,
+            preferences_requested: None,
             driver_error: None,
             label_flip: false,
             crops: Vec::new(),
@@ -145,6 +150,12 @@ impl Default for PrintDraft {
 impl PrintDraft {
     /// The engine settings for this draft (page count and labels from the document).
     pub fn settings(&self, count: usize, labels: &[String]) -> Result<print::Settings, String> {
+        if self.preferences_loading {
+            return Err("Finish Printer Properties before printing".into());
+        }
+        if let Some(error) = &self.driver_error {
+            return Err(error.clone());
+        }
         if self.handling == Handling::Multiple && self.order == PageOrder::CutStack && self.duplex != spool::Duplex::Off {
             return Err("Cut and stack needs Two-sided: Off. Print single-sided sheets.".into());
         }
@@ -208,6 +219,40 @@ impl PrintDraft {
             .collect(),
         }
     }
+
+    /// Synchronize the app's layout and ticket with the driver's accepted preset.
+    #[cfg(any(not(target_arch = "wasm32"), test))]
+    fn apply_driver_settings(&mut self, settings: spool::DriverSettings) -> Result<(), String> {
+        let paper = settings
+            .paper
+            .map(|(w, h)| {
+                PAPERS
+                    .iter()
+                    .position(|(_, (pw, ph))| (pw.min(*ph) - w.min(h)).abs() < 0.75 && (pw.max(*ph) - w.max(h)).abs() < 0.75)
+                    .ok_or_else(|| "The driver selected an unsupported paper size; choose a supported size in Properties".to_owned())
+            })
+            .transpose()?;
+        if let Some(paper) = paper {
+            self.paper = paper;
+        }
+        if let Some(value) = settings.grayscale {
+            self.grayscale = value;
+        }
+        if let Some(value) = settings.duplex {
+            self.duplex = value;
+        }
+        if let Some(value) = settings.copies {
+            self.copies = value;
+        }
+        if let Some(value) = settings.collate {
+            self.collate = value;
+        }
+        if let Some(value) = settings.landscape {
+            self.orientation = if value { Orientation::Landscape } else { Orientation::Portrait };
+        }
+        self.sheet = 0;
+        Ok(())
+    }
 }
 
 /// Lists the printers off the UI thread (the desktop app sets [`PdfCraftApp::printer_source`]):
@@ -226,6 +271,8 @@ pub fn system_printers() -> PrinterSource {
 pub(crate) struct PrintTasks {
     #[cfg(not(target_arch = "wasm32"))]
     printers: Option<std::sync::mpsc::Receiver<Vec<spool::Printer>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    preferences: Option<(String, std::sync::mpsc::Receiver<Result<spool::DriverSettings, String>>)>,
     #[cfg(not(target_arch = "wasm32"))]
     jobs: Vec<PrintJob>,
     /// The progress card is showing a print job (it is shared with other long jobs).
@@ -318,6 +365,7 @@ impl PdfCraftApp {
             printers,
             printers_loading,
             printer_picked: false,
+            driver_error: None,
             units: self.units,
             printer: default,
             current_page: current,
@@ -397,6 +445,44 @@ impl PdfCraftApp {
         self.poll_web_print();
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if let Some(printer) = self.print_draft.preferences_requested.take() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let selected = printer.clone();
+                let ctx = self.ctx.clone();
+                let worker = std::thread::Builder::new().name("printer-preferences".into()).spawn(move || {
+                    let result = std::panic::catch_unwind(|| spool::edit_printer_preferences(&selected))
+                        .map_err(|_| "The printer driver could not return its settings; open Properties again".to_owned())
+                        .and_then(|result| result.map_err(|e| e.to_string()));
+                    let _ = tx.send(result);
+                    if let Some(ctx) = ctx {
+                        ctx.request_repaint();
+                    }
+                });
+                match worker {
+                    Ok(_) => self.print_tasks.preferences = Some((printer, rx)),
+                    Err(e) => {
+                        self.print_draft.preferences_loading = false;
+                        self.print_draft.driver_error = Some(e.to_string());
+                    }
+                }
+            }
+            if let Some((printer, rx)) = &self.print_tasks.preferences {
+                let result = match rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("The printer preferences worker stopped; open Properties again".into()))
+                    }
+                };
+                if let Some(result) = result {
+                    let same_printer = self.print_draft.printer.as_deref() == Some(printer.as_str());
+                    self.print_tasks.preferences = None;
+                    self.print_draft.preferences_loading = false;
+                    if same_printer && self.dialog == Some(crate::Dialog::Print) {
+                        self.print_draft.driver_error = result.and_then(|settings| self.print_draft.apply_driver_settings(settings)).err();
+                    }
+                }
+            }
             if let Some(rx) = &self.print_tasks.printers {
                 let printers = match rx.try_recv() {
                     Ok(p) => Some(p),
@@ -843,16 +929,19 @@ pub(crate) fn body(
                         }
                     });
                     let tip = if spool::HAS_PRINTER_PREFERENCES {
-                        tl!("Opens the printer driver's preferences. They are saved for every print from this computer; the copies, two-sided, grayscale and paper chosen here still apply.")
+                        "Opens the printer driver's preferences. When it closes, paper, color, copies and two-sided settings are read back into this dialog."
                     } else {
                         tl!("The printer driver's own settings for this print: paper tray, paper type, finishing and more.")
                     };
-                    let properties = ui.add_enabled(d.printer.is_some() && !browser, egui::Button::new(tl!("Properties…"))).on_hover_text(tip);
+                    let properties = ui.add_enabled(d.printer.is_some() && !browser && !d.preferences_loading, egui::Button::new(tl!("Properties…"))).on_hover_text(tip);
                     if properties.clicked()
                         && let Some(p) = d.printer.clone()
                     {
                         if spool::HAS_PRINTER_PREFERENCES {
-                            d.driver_error = spool::open_printer_preferences(&p).err().map(|e| e.to_string());
+                            d.driver_error = None;
+                            d.printer_picked = true;
+                            d.preferences_loading = true;
+                            d.preferences_requested = Some(p);
                         } else {
                             if d.driver_options.as_ref().is_none_or(|(read_for, _)| *read_for != p) {
                                 d.driver_options = Some((p.clone(), spool::printer_options(&p)));
@@ -1159,7 +1248,9 @@ pub(crate) fn body(
                                     mesh.vertices.push(egui::epaint::Vertex {
                                         pos: *p,
                                         uv: u,
-                                        color: if d.grayscale { Color32::from_gray(235) } else { Color32::WHITE },
+                                        // The texture already has the chosen color mode. Tinting it
+                                        // would darken grayscale paper and alter the printed colors.
+                                        color: Color32::WHITE,
                                     });
                                 }
                                 mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
@@ -1243,6 +1334,61 @@ pub(crate) fn body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn driver_preset_replaces_stale_app_color_and_paper_before_printing() {
+        let mut draft = PrintDraft { printer: Some("Apeos test queue".into()), paper: 0, grayscale: false, ..Default::default() };
+        draft
+            .apply_driver_settings(spool::DriverSettings {
+                paper: Some((595.28, 841.89)),
+                grayscale: Some(true),
+                duplex: Some(spool::Duplex::LongEdge),
+                copies: Some(2),
+                collate: Some(false),
+                landscape: Some(false),
+            })
+            .unwrap();
+        let settings = draft.settings(1, &["1".into()]).unwrap();
+        assert_eq!(settings.paper, PAPERS[4].1);
+        let job = draft.job("synthetic.pdf");
+        assert!(job.grayscale);
+        assert_eq!(job.copies, 2);
+        assert_eq!(job.duplex, Some(spool::Duplex::LongEdge));
+        assert!(!job.collate);
+        assert!(job.options.contains(&("media".into(), "A4".into())));
+        draft.preferences_loading = true;
+        assert!(draft.settings(1, &["1".into()]).is_err(), "never print stale settings while Properties is open");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn printer_properties_results_reach_the_draft_but_never_another_printer() {
+        for same_printer in [true, false] {
+            let mut app = PdfCraftApp::new();
+            app.dialog = Some(crate::Dialog::Print);
+            app.print_draft.printer = Some(if same_printer { "selected" } else { "other" }.into());
+            app.print_draft.preferences_loading = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.print_tasks.preferences = Some(("selected".into(), rx));
+            app.poll_print();
+            assert!(app.print_draft.preferences_loading);
+            tx.send(Ok(spool::DriverSettings { paper: Some(PAPERS[4].1), grayscale: Some(true), ..Default::default() })).unwrap();
+            app.poll_print();
+            assert!(!app.print_draft.preferences_loading);
+            assert_eq!(app.print_draft.grayscale, same_printer);
+            assert_eq!(app.print_draft.paper, if same_printer { 4 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn unsupported_driver_paper_is_reported_without_partly_changing_the_draft() {
+        let mut draft = PrintDraft::default();
+        let before = draft.clone();
+        assert!(
+            draft.apply_driver_settings(spool::DriverSettings { paper: Some((13.0, 17.0)), grayscale: Some(true), ..Default::default() }).is_err()
+        );
+        assert_eq!(draft, before);
+    }
 
     #[test]
     fn current_page_preview_uses_positions_and_selection_guards() {

@@ -73,6 +73,52 @@ fn ok(h: &mut Harness<'static, PdfCraftApp>, c: &ControlClient, method: &str, pa
     call(h, c, method, params).unwrap_or_else(|e| panic!("{method}: {e}"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn control_combine_original_paths_keep_modified_and_sort_without_saving() {
+    use std::fs::{File, FileTimes};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("pdfcraft-original-combine-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let late = dir.join("late.png");
+    let early = dir.join("early.png");
+    for (path, seconds) in [(&late, 1_700_000_000), (&early, 1_600_000_000)] {
+        let mut encoder = png::Encoder::new(File::create(path).unwrap(), 2, 2);
+        encoder.set_color(png::ColorType::Rgb);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[30, 80, 140, 30, 80, 140, 30, 80, 140, 30, 80, 140]).unwrap();
+        writer.finish().unwrap();
+        File::options().write(true).open(path).unwrap().set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds))).unwrap();
+    }
+    let (mut h, c) = harness();
+    ok(&mut h, &c, "ui.set", json!({"key": "combine-view", "value": "list"}));
+    ok(&mut h, &c, "ui.combine.add", json!({"paths": [late, early]}));
+    let state = ok(&mut h, &c, "ui.state", json!({}));
+    assert_eq!(state["combine"]["files"], json!(["late.png", "early.png"]));
+    assert_eq!(state["combine"]["items"][0]["modified_unix_seconds"], 1_700_000_000u64);
+    assert_eq!(state["combine"]["items"][1]["modified_unix_seconds"], 1_600_000_000u64);
+    assert_eq!(state["documents"].as_array().unwrap().len(), 1, "source images must not become unsaved tabs");
+    ok(&mut h, &c, "ui.click", json!({"label": "Modified"}));
+    assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["combine"]["files"], json!(["early.png", "late.png"]));
+    ok(&mut h, &c, "ui.click", json!({"label": "Modified, sorted ascending"}));
+    assert_eq!(ok(&mut h, &c, "ui.state", json!({}))["combine"]["files"], json!(["late.png", "early.png"]));
+    for invalid in [json!({"paths": []}), json!({"paths": [12]}), json!({"paths": [""]}), json!({"paths": ["x"], "unknown": true})] {
+        assert!(call(&mut h, &c, "ui.combine.add", invalid).is_err());
+    }
+    assert!(call(&mut h, &c, "ui.combine.add", json!({"paths": vec![late.clone(); 1001]})).is_err());
+    assert!(call(&mut h, &c, "ui.combine.add", json!({"paths": [late, dir.join("missing.png")]})).is_err());
+    assert_eq!(
+        ok(&mut h, &c, "ui.state", json!({}))["combine"]["files"],
+        json!(["late.png", "early.png"]),
+        "a failed batch must not partly add files"
+    );
+    assert_eq!(std::fs::metadata(&late).unwrap().modified().unwrap(), UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+    assert_eq!(std::fs::metadata(&early).unwrap().modified().unwrap(), UNIX_EPOCH + Duration::from_secs(1_600_000_000));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn control_resize_reports_observed_dimensions_and_rejects_invalid_sizes() {
     let (mut h, c) = harness();

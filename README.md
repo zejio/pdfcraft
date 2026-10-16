@@ -1,11 +1,10 @@
-<p align="center">
-  <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
-  </a>
-</p>
+# PdfCraft — Windows community update
+
+This modified build is maintained by **@zejio**, based on PdfCraft by the ArtCraft
+team and community. [Download the Windows update](https://github.com/zejio/pdfcraft/releases/tag/explorer-update-v1.2.0)
+and see [installation, validation and source details](docs/windows-community-update.md).
+The ArtCraft trademark graphics are omitted from this community distribution.
+
 
 
 <h1 align="center">PdfCraft</h1>
@@ -249,7 +248,6 @@ Press <kbd>⌘K</kbd> to search every tool and command, or browse the **All tool
 <table>
 <tr>
 <td width="50%"><img src="docs/images/pdfcraft-palette.png" alt="The command palette searching for 'page', listing Page grid, Page labels, Rotate pages, Insert pages, Delete pages, Extract pages and more, each with the tool it belongs to"></td>
-<td width="50%"><img src="docs/images/pdfcraft-tools.png" alt="The Welcome to PdfCraft home screen with recommended tools, a recent file, a privacy note, and the full tool catalogue in the side panel"></td>
 </tr>
 <tr>
 <td align="center"><sub>The <kbd>⌘K</kbd> command palette</sub></td>
@@ -584,7 +582,6 @@ Forks and modified versions must remove them.
 <sub>Adobe, Photoshop, Illustrator, Premiere Pro, Lightroom, Acrobat, After Effects and InDesign are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries. PdfCraft is an independent, open-source project and is not affiliated with, sponsored by or endorsed by Adobe Inc.; these names are used only to describe the workflows it is compatible with.</sub>
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
   <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
 </p>
 
